@@ -35,7 +35,7 @@ class AlpacaWSConfig:
     ping_interval_s: float = 20.0
     # subscription kinds (trades/quotes/bars); we’ll default to trades
     subscribe_trades: bool = True
-    subscribe_quotes: bool = False
+    subscribe_quotes: bool = True
     subscribe_bars: bool = False
 
 
@@ -59,28 +59,32 @@ class AlpacaWS:
         await client.start()   # runs until cancelled/stop() called
     """
 
+    # --- in your class __init__ signature & body ---
     def __init__(
         self,
         cfg: AlpacaWSConfig,
         ticks_queue: asyncio.Queue,
         market_is_open: Optional[callable] = None,
+        heartbeat_secs_getter: Optional[callable] = None,  # NEW: dynamic heartbeat by phase
     ):
         self.cfg = cfg
         self.q_ticks = ticks_queue
         self.market_is_open = market_is_open or (lambda: True)
 
+        # If provided, should return an int/float seconds (or None when market closed)
+        # e.g., lambda: 8 during RTH, 45 during extended, None when closed.
+        self._heartbeat_secs_getter = heartbeat_secs_getter
+
         self._log = structlog.get_logger("alpaca_ws")
         self._stop = asyncio.Event()
         self._connected = asyncio.Event()
         self._last_msg_ts: float = 0.0
-        self._ws = None  # set when connected
+        self._ws = None
 
-        # exported health-ish flags (read by /healthz if you want)
         self.connected: bool = False
         self.authenticated: bool = False
         self.subscribed: bool = False
 
-        # at top of class __init__
         self._prebuffer: list[dict] = []
 
 

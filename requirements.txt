@@ -17,3 +17,5 @@ structlog==25.4.0
 toolz==1.0.0
 tzdata==2025.2
 websockets==15.0.1
+redis>=5
+python-dotenv
