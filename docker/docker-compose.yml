@@ -1,0 +1,67 @@
+version: "3.9"
+
+x-app-env: &app_env
+  # Values come from ../.env at compose time (see env_file below)
+  ALPACA_KEY_ID: ${ALPACA_KEY_ID}
+  ALPACA_SECRET_KEY: ${ALPACA_SECRET_KEY}
+  ALPACA_STREAM_URL: ${ALPACA_STREAM_URL:-wss://stream.data.alpaca.markets/v2/sip}
+  SYMBOLS: ${SYMBOLS:-AAPL,NVDA,AMD,QQQ,SOFI}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  # Make sure Python sees your /src package
+  PYTHONPATH: /app/src
+  # unbuffered logs
+  PYTHONUNBUFFERED: "1"
+
+services:
+  redis:
+    image: redislabs/redistimeseries:latest
+    container_name: redis-ts
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: stock-monitor-app
+    # Load secrets/vars from the repo root .env (relative to this compose file)
+    env_file:
+      - ../.env
+    environment: *app_env
+    depends_on:
+      redis:
+        condition: service_healthy
+    # DEV profile: live-mount source for fast iteration
+    volumes:
+      - ../src:/app/src:rw
+      - ../requirements.txt:/app/requirements.txt:ro
+    command: ["python", "-m", "monitor.main"]
+    restart: unless-stopped
+    profiles: ["dev"]
+
+  app-prod:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: stock-monitor-app-prod
+    env_file:
+      - ../.env
+    environment: *app_env
+    depends_on:
+      redis:
+        condition: service_healthy
+    # In prod we run with the code baked into the image (no mounts)
+    command: ["python", "-m", "monitor.main"]
+    restart: unless-stopped
+    profiles: ["prod"]
+
+volumes:
+  redis_data:
