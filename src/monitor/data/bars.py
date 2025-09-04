@@ -1,33 +1,39 @@
+# src/monitor/data/bars.py
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
 from typing import Dict, Optional
 
-from monitor.utils.time import floor_to_second, utc_now_s
+from monitor.utils.time import utc_now_s
 from monitor.data.ring_buffer import RingBufferOHLCV, Bar as RingBar
+
 
 @dataclass(slots=True)
 class BarConfig:
-    buffer_seconds: int = 7200
-    emit_gap_fill: bool = True       # fill missing seconds with flat bars
-    idle_finalize_ms: int = 250      # finalize open bar if idle for this long
+    buffer_seconds: int = 7200          # how much history (in wall-clock seconds) to retain
+    bar_seconds:     int = 1            # bar width: 1 = 1s bars, 10 = 10s bars, 60 = 1m bars, ...
+    emit_gap_fill:   bool = True        # fill missing buckets with flat bars (O=H=L=C=prev_close, V=0)
+    idle_finalize_ms:int = 250          # finalize open bucket if idle for this long
+
 
 @dataclass(slots=True)
 class _Acc:
-    epoch: Optional[int] = None
+    epoch: Optional[int] = None   # bucket start (aligned to bar_seconds)
     o: float = 0.0
     h: float = 0.0
     l: float = 0.0
     c: float = 0.0
     v: float = 0.0
-    last_update_ts: float = 0.0
+    last_update_ts: float = 0.0   # last tick timestamp seen (float seconds)
+
 
 class BarAggregator:
     """
-    Consumes ticks and builds finalized 1s bars per symbol.
+    Consumes ticks and builds finalized OHLCV bars per symbol with configurable period.
+    - Buckets ticks by `bar_seconds` (e.g., 1s, 10s, 60s)
     - Writes finalized bars into per-symbol RingBufferOHLCV
-    - Optionally emits (symbol, epoch) to q_bars for downstream indicator engine
+    - Optionally emits (symbol, epoch) to q_bars for downstream engines
     """
     def __init__(
         self,
@@ -37,16 +43,28 @@ class BarAggregator:
         q_bars: Optional[asyncio.Queue] = None,
         cfg: Optional[BarConfig] = None,
     ):
+        # allow passing buffer_seconds for convenience; cfg can override bar_seconds, etc.
         self.cfg = cfg or BarConfig(buffer_seconds=buffer_seconds)
+
+        if self.cfg.bar_seconds <= 0:
+            raise ValueError("bar_seconds must be >= 1")
+
         self.q_ticks = q_ticks
         self.q_bars = q_bars
-        self.rings: Dict[str, RingBufferOHLCV] = {s: RingBufferOHLCV(self.cfg.buffer_seconds) for s in symbols}
+
+        # Ring capacity is measured in *bars*, not seconds.
+        self._cap_bars = max(1, int(self.cfg.buffer_seconds // self.cfg.bar_seconds))
+
+        self.rings: Dict[str, RingBufferOHLCV] = {
+            s: RingBufferOHLCV(self._cap_bars) for s in symbols
+        }
         self.acc: Dict[str, _Acc] = {s: _Acc() for s in symbols}
+
         self._stop = asyncio.Event()
 
     def get_ring(self, symbol: str) -> RingBufferOHLCV:
         if symbol not in self.rings:
-            self.rings[symbol] = RingBufferOHLCV(self.cfg.buffer_seconds)
+            self.rings[symbol] = RingBufferOHLCV(self._cap_bars)
             self.acc[symbol] = _Acc()
         return self.rings[symbol]
 
@@ -55,6 +73,7 @@ class BarAggregator:
         try:
             while not self._stop.is_set():
                 tick = await self.q_ticks.get()
+                # Expect tick has attributes: symbol, px, size, ts (float seconds)
                 self._on_tick(tick.symbol, float(tick.px), float(tick.size), float(tick.ts))
         finally:
             self._stop.set()
@@ -69,41 +88,53 @@ class BarAggregator:
     # ---- core ----
 
     def _on_tick(self, symbol: str, px: float, size: float, ts: float) -> None:
-        epoch = int(ts)  # floor to second, ticks already normalized upstream
+        # Align the tick to the start of the current bar bucket.
+        bs = self.cfg.bar_seconds
+        epoch = (int(ts) // bs) * bs
+
         a = self.acc.setdefault(symbol, _Acc())
+
         if a.epoch is None:
             # first tick for this symbol
             self._start_new(symbol, epoch, px, size, ts)
             return
 
         if epoch < a.epoch:
-            # late tick; ignore (policy: drop)
+            # late/old tick relative to current bucket; policy: drop
             return
 
         if epoch == a.epoch:
-            # same second: update accumulator
+            # same bucket: update accumulator
             a.c = px
-            a.h = px if px > a.h else a.h
-            a.l = px if px < a.l else a.l
+            if px > a.h:
+                a.h = px
+            if px < a.l:
+                a.l = px
             a.v += size
             a.last_update_ts = ts
             return
 
-        # epoch advanced: finalize previous second and fill any gaps
+        # bucket advanced: finalize the previous bucket
         self._finalize(symbol, a.epoch, a.o, a.h, a.l, a.c, a.v)
 
-        # gap fill between a.epoch+1 .. epoch-1
+        # gap fill for any missing buckets between a.epoch and new epoch
         if self.cfg.emit_gap_fill and a.c > 0.0:
-            for sec in range(a.epoch + 1, epoch):
-                self._finalize(symbol, sec, a.c, a.c, a.c, a.c, 0.0)
+            missing = a.epoch + bs
+            while missing < epoch:
+                # flat bar at previous close, zero volume
+                self._finalize(symbol, missing, a.c, a.c, a.c, a.c, 0.0)
+                missing += bs
 
-        # start accumulator for this tick's second
+        # start accumulator for this new bucket
         self._start_new(symbol, epoch, px, size, ts)
 
     def _start_new(self, symbol: str, epoch: int, px: float, size: float, ts: float) -> None:
         a = self.acc[symbol]
         a.epoch = epoch
-        a.o = a.h = a.l = a.c = px
+        a.o = px
+        a.h = px
+        a.l = px
+        a.c = px
         a.v = size
         a.last_update_ts = ts
 
@@ -117,20 +148,58 @@ class BarAggregator:
                 # drop: downstream is slow; keep hot path non-blocking
                 pass
 
+
     def _finalize_if_open(self, symbol: str, force: bool = False) -> None:
         a = self.acc.get(symbol)
         if not a or a.epoch is None:
             return
-        # if idle for configured time or force at shutdown
-        if force or (utc_now_s() - a.last_update_ts) * 1000.0 >= self.cfg.idle_finalize_ms:
-            self._finalize(symbol, a.epoch, a.o, a.h, a.l, a.c, a.v)
-            # reset epoch so next tick starts a new bar
-            self.acc[symbol] = _Acc()
+
+        bs = self.cfg.bar_seconds
+        now = utc_now_s()
+        now_epoch = (int(now) // bs) * bs  # align "now" to current bucket start
+
+        if not force:
+            # Don't close while we're still inside the current bucket.
+            if now_epoch <= a.epoch:
+                return
+            # Be sure we've actually been idle long enough.
+            if (now - a.last_update_ts) * 1000.0 < self.cfg.idle_finalize_ms:
+                return
+
+        # 1) finalize the current (just-finished) bucket
+        self._finalize(symbol, a.epoch, a.o, a.h, a.l, a.c, a.v)
+
+        # Choose a prior close to seed empty bars/new bucket.
+        prev_close = a.c if a.c > 0.0 else (a.o if a.o > 0.0 else 0.0)
+
+        # 2) emit *all* missing empty buckets up to now_epoch (exclusive), stepping by bar size
+        if self.cfg.emit_gap_fill and prev_close > 0.0:
+            t = a.epoch + bs
+            while t < now_epoch:
+                self._finalize(symbol, t, prev_close, prev_close, prev_close, prev_close, 0.0)
+                t += bs
+
+        # 3) open a new (empty) accumulator for the *current* bucket
+        a.epoch = now_epoch
+        if prev_close > 0.0:
+            a.o = a.h = a.l = a.c = prev_close
+        else:
+            # no prior price yet; leave zeroed until first tick arrives
+            a.o = a.h = a.l = a.c = 0.0
+        a.v = 0.0
+        a.last_update_ts = now
+
 
     async def _idle_finalizer_loop(self) -> None:
+        """
+        Periodically check for idle buckets and roll them forward.
+        Cadence: a few times per bar (but not too chatty).
+        """
+        # e.g., bar_seconds=30 -> interval ~0.5s; bar_seconds=1 -> 0.2s
+        interval = max(0.2, min(0.5, self.cfg.bar_seconds / 60.0))
         try:
             while not self._stop.is_set():
-                await asyncio.sleep(self.cfg.idle_finalize_ms / 1000.0)
+                await asyncio.sleep(interval)
                 for s in list(self.acc.keys()):
                     self._finalize_if_open(s, force=False)
         except asyncio.CancelledError:

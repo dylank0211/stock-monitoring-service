@@ -2,7 +2,7 @@ import os, asyncio, structlog
 from dotenv import load_dotenv; load_dotenv()
 
 from monitor.ingest.alpaca_ws import AlpacaWS, AlpacaWSConfig
-from monitor.data.bars import BarAggregator
+from monitor.data.bars import BarAggregator, BarConfig  # <— import BarConfig
 from monitor.alerts.evaluator import PriceDropEvaluator, EvaluatorConfig
 from monitor.alerts.rules import PriceDropRule
 
@@ -39,28 +39,31 @@ async def main():
             key_id=key_id,
             secret_key=secret_key,
             symbols=symbols,
-            expect_heartbeat_s=8.0,     # fallback if getter isn't used
+            expect_heartbeat_s=8.0,     # fallback
             subscribe_trades=True,
-            subscribe_quotes=True,      # prove trades first; turn on later
-            subscribe_bars=True,
+            subscribe_quotes=False,      # keep simple while testing
+            subscribe_bars=False,
         ),
         q_ticks,
-        market_is_open=lambda: is_market_open_now("any"),  # count extended hours as open
-        heartbeat_secs_getter=heartbeat_secs_getter,       # NEW: dynamic heartbeat by phase
+        market_is_open=lambda: is_market_open_now("any"),
+        heartbeat_secs_getter=heartbeat_secs_getter,  # if your class supports it
     )
 
+    # ---------- 10-second bars over last 2 hours ----------
+    # buffer_seconds stays 7200 (2h). bar_seconds=10 → ring capacity ≈ 720 bars/symbol.
     aggregator = BarAggregator(
         symbols=symbols,
         buffer_seconds=7200,
         q_ticks=q_ticks,
-        q_bars=q_bars
+        q_bars=q_bars,
+        cfg=BarConfig(buffer_seconds=7200, bar_seconds=30, emit_gap_fill=True, idle_finalize_ms=300),
     )
 
     alerts = PriceDropEvaluator(
         q_bars=q_bars,
         get_ring=aggregator.get_ring,
         q_alerts=q_alerts,
-        cfg=EvaluatorConfig(rule=PriceDropRule(drop_threshold=0.01)),  # 1%
+        cfg=EvaluatorConfig(rule=PriceDropRule(drop_threshold=0.01)),  # 1% over your 2h window
     )
 
     async def notifier_loop():
@@ -69,17 +72,37 @@ async def main():
             log.info("ALERT", **evt)
 
     async def debug_bar_logger(q_bars, get_ring):
-        from datetime import datetime
+        from datetime import datetime, UTC
+        import numpy as np
+
         while True:
             symbol, epoch = await q_bars.get()
             ring = get_ring(symbol)
-            v = ring.view_last(1)
-            if not v.slices:
-                continue
-            ep, o, h, l, c, vol = v.slices[-1]
-            i = -1
-            ts = datetime.utcfromtimestamp(int(ep[i])).strftime("%Y-%m-%d %H:%M:%S")
-            print(f"BAR {symbol} {ts} O={o[i]:.3f} H={h[i]:.3f} L={l[i]:.3f} C={c[i]:.3f} V={vol[i]:.0f}")
+
+            # search the ring for the exact epoch we were notified about
+            # (two slices possible due to wrap)
+            v = ring.view_last(ring.size or 1)
+            found = False
+
+            for (ep, o, h, l, c, vol) in v.slices:
+                # np.where on the slice
+                idxs = np.where(ep == epoch)[0]
+                if idxs.size:
+                    i = int(idxs[-1])  # take last match if any (should be unique)
+                    ts = datetime.fromtimestamp(int(ep[i]), UTC).strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"BAR {symbol} {ts} O={o[i]:.3f} H={h[i]:.3f} L={l[i]:.3f} C={c[i]:.3f} V={vol[i]:.0f}")
+                    found = True
+                    break
+
+            if not found:
+                # If not found, ring advanced before we printed (rare but possible)
+                # fall back to printing the last bar so we don't silently drop logs
+                v2 = ring.view_last(1)
+                if v2.slices:
+                    ep, o, h, l, c, vol = v2.slices[-1]
+                    i = -1
+                    ts = datetime.fromtimestamp(int(ep[i]), UTC).strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"BAR {symbol} {ts} O={o[i]:.3f} H={h[i]:.3f} L={l[i]:.3f} C={c[i]:.3f} V={vol[i]:.0f}  (latest, not exact)")
 
     await asyncio.gather(
         ingestor.start(),
