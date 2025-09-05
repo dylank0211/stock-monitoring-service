@@ -12,10 +12,12 @@ from monitor.indicators.basic_indicators import IndicatorsEngine, IndicatorsConf
 
 from monitor.utils.market_calendar import is_market_open_now, session_state_now
 
-# Alerts (Redis-backed percent move)
+# Alerts (Redis-backed, extremum-based)
 from monitor.alerts.rules import PercentMoveRule
 from monitor.alerts.evaluator_redis import PercentMoveEvaluatorRedis, RedisEvaluatorConfig
-from monitor.alerts.notifiers import ConsoleNotifier  # simple stdout notifier
+from monitor.alerts.notifiers import ConsoleNotifier
+from monitor.alerts.formatting import format_alert_pretty
+
 
 # Redis storage helpers
 from redis.asyncio import Redis
@@ -164,7 +166,7 @@ async def persist_full(q_store: asyncio.Queue, symbols: list[str]):
         await write_bar_bundle(
             r, sym, epoch_ms,
             o=full["o"], h=full["h"], l=full["l"], c=full["c"], v=full["v"],
-            vwap=full["vwap"],
+            vwap=full["vwap"],  # your redis_metrics skips/guards NaN internally
             indicators=indicators,
         )
 
@@ -277,7 +279,7 @@ async def main():
     q_join  = asyncio.Queue(maxsize=5_000)
     q_store = asyncio.Queue(maxsize=5_000)
 
-    # Alerts output (from evaluator)
+    # Alerts output (from evaluators)
     q_alerts_move = asyncio.Queue(maxsize=2_000)
 
     # Heartbeat policy for Alpaca WS
@@ -351,25 +353,41 @@ async def main():
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     redis_client = Redis.from_url(REDIS_URL)
 
-    # Alerts: ±0.25% in 30 minutes, dedup 5m buckets, 10m cooldown
-    pct_rule = PercentMoveRule(
-        name="pct_move_30m_0p25",
+    # ----- Alerts: separate UP and DOWN extremum rules -----
+    up_rule = PercentMoveRule(
+        name="pct_up_30m_0p25",
         window_seconds=1800,
         threshold=0.0025,
-        direction="abs",
-        cooldown_seconds=600,
-        dedupe_bucket_seconds=300,
+        direction="up",
+        cooldown_seconds=180,          # 3 min
+        dedupe_bucket_seconds=180,     # dedupe per 3-min bucket
         auto_resolve=False,
     )
-    pct_eval_redis = PercentMoveEvaluatorRedis(
+    down_rule = PercentMoveRule(
+        name="pct_down_30m_0p25",
+        window_seconds=1800,
+        threshold=0.0025,
+        direction="down",
+        cooldown_seconds=0,            # allow immediate down alerts after an up
+        dedupe_bucket_seconds=60,      # but dedupe within 1-min buckets
+        auto_resolve=False,
+    )
+
+    pct_eval_up = PercentMoveEvaluatorRedis(
         q_bars=q_bars_eval,
         q_alerts=q_alerts_move,
         redis=redis_client,
-        cfg=RedisEvaluatorConfig(rule=pct_rule, timeframe="30s", field="C"),
+        cfg=RedisEvaluatorConfig(rule=up_rule, timeframe="30s", field="C"),
+    )
+    pct_eval_down = PercentMoveEvaluatorRedis(
+        q_bars=q_bars_eval,
+        q_alerts=q_alerts_move,
+        redis=redis_client,
+        cfg=RedisEvaluatorConfig(rule=down_rule, timeframe="30s", field="C"),
     )
 
     # ----- Notifications -----
-    console_notifier = ConsoleNotifier()
+    console_notifier = ConsoleNotifier(format_fn=lambda e: format_alert_pretty(e, "America/Chicago"))
 
     # Optional Telegram (built from env). If not configured, we skip it.
     telegram_enabled = False
@@ -378,7 +396,8 @@ async def main():
     try:
         tg_cfg = config_from_env()  # raises if env missing
         notify_q = NotifyQueue(maxsize=2000)
-        tg_notifier = TelegramNotifier(cfg=tg_cfg, alerts_queue=notify_q)
+        tg_notifier = TelegramNotifier(cfg=tg_cfg, alerts_queue=notify_q,
+                                    format_fn=lambda e: format_alert_pretty(e, "America/Chicago"))        
         telegram_enabled = True
         log.info("telegram_enabled")
     except Exception:
@@ -386,7 +405,7 @@ async def main():
 
     async def notifier_router_loop():
         """
-        Consume alerts from evaluator and fan out:
+        Consume alerts from evaluators and fan out:
           - always print to console
           - if Telegram configured, enqueue to Telegram notifier queue
         """
@@ -421,8 +440,9 @@ async def main():
         join_and_store(q_join, q_store),
         persist_full(q_store, symbols),
 
-        # Alerts (Redis-backed) + notifier router
-        pct_eval_redis.start(),
+        # Alerts (Redis-backed, extremum-based) + notifier router
+        pct_eval_up.start(),
+        pct_eval_down.start(),
         notifier_router_loop(),
     ]
     if PRINT_BARS:
@@ -435,26 +455,13 @@ async def main():
         await asyncio.gather(*tasks)
     finally:
         # graceful shutdown to avoid unclosed sessions
-        try:
-            await pct_eval_redis.stop()
-        except Exception:
-            pass
-        try:
-            await ind_engine.stop()
-        except Exception:
-            pass
-        try:
-            await vwap_engine.stop()
-        except Exception:
-            pass
-        try:
-            await aggregator.stop()
-        except Exception:
-            pass
-        try:
-            await ingestor.stop()
-        except Exception:
-            pass
+        for obj in (
+            pct_eval_up, pct_eval_down, ind_engine, vwap_engine, aggregator, ingestor
+        ):
+            try:
+                await obj.stop()
+            except Exception:
+                pass
         if telegram_enabled and tg_notifier is not None:
             try:
                 await tg_notifier.stop()
