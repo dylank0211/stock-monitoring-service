@@ -231,6 +231,8 @@ class PercentMoveEvaluatorRedis:
             self._cooldown_until[cd_key] = epoch + dir_cd
         self._last_fired_pct[fired_key] = float(pct)
 
+        elapsed_min = (epoch - ref_epoch) / 60  
+
         # Build rich alert event (used by format_alert_pretty)
         evt = {
             "symbol": symbol,
@@ -252,8 +254,9 @@ class PercentMoveEvaluatorRedis:
 
             # Back-compat message (your pretty formatter will ignore this)
             "message": (
-                f"{symbol} {'↑' if eff_direction=='up' else '↓'} {pct*100:.2f}% over ~{self.rule.window_seconds // 60}m "
-                f"(C {ref_price:.2f} → {last_close:.2f})"
+                f"{symbol} {'↑' if eff_direction=='up' else '↓'} {pct*100:.2f}% in past {elapsed_min:.0f}m "
+                f"(ref: {self.rule.window_seconds // 60}m {'LOW' if eff_direction=='up' else 'HIGH'}) "
+                f"| {ref_price:.2f} @ {ref_epoch} → {last_close:.2f} now"
             ),
             "dedupe_key": dkey,
         }
