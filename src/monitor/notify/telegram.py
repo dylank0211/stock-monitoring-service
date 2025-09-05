@@ -1,10 +1,11 @@
+# src/monitor/notify/telegram.py
 from __future__ import annotations
 
 import asyncio
 import os
 import random
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Callable, Mapping, Any
 
 import aiohttp
 import structlog
@@ -18,12 +19,12 @@ class RateLimiter:
         self.rate = float(rate_per_sec)
         self.capacity = int(burst)
         self.tokens = float(burst)
-        self.updated = asyncio.get_event_loop().time()
+        self.updated = asyncio.get_running_loop().time()
         self._lock = asyncio.Lock()
 
     async def acquire(self):
         async with self._lock:
-            now = asyncio.get_event_loop().time()
+            now = asyncio.get_running_loop().time()
             # refill
             self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
             self.updated = now
@@ -31,8 +32,8 @@ class RateLimiter:
             if self.tokens < 1.0:
                 needed = 1.0 - self.tokens
                 await asyncio.sleep(needed / self.rate)
-                self.updated = asyncio.get_event_loop().time()
-                self.tokens = max(0.0, self.tokens)  # just for safety
+                self.updated = asyncio.get_running_loop().time()
+                self.tokens = max(0.0, self.tokens)
             self.tokens -= 1.0
 
 # --------- config & client ----------
@@ -49,14 +50,31 @@ class TelegramConfig:
     initial_backoff_s: float = 0.5
     max_backoff_s: float = 8.0
 
+def config_from_env() -> TelegramConfig:
+    """
+    Build TelegramConfig from env:
+      TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, optional TELEGRAM_PARSE_MODE
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in env")
+    parse_mode = os.getenv("TELEGRAM_PARSE_MODE") or None
+    return TelegramConfig(bot_token=token, chat_id=chat_id, parse_mode=parse_mode)
+
 class TelegramNotifier:
     """
     Background worker that drains an alerts queue and sends to Telegram with
     rate limiting and retry w/ backoff.
     """
-    def __init__(self, cfg: TelegramConfig, alerts_queue, format_fn=None):
+    def __init__(
+        self,
+        cfg: TelegramConfig,
+        alerts_queue,
+        format_fn: Optional[Callable[[Mapping[str, Any]], str]] = None
+    ):
         self.cfg = cfg
-        self.q = alerts_queue  # something with .get() (q_alerts or NotifyQueue)
+        self.q = alerts_queue  # something with .get() (NotifyQueue or asyncio.Queue)
         self._session: Optional[aiohttp.ClientSession] = None
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
@@ -103,7 +121,8 @@ class TelegramNotifier:
         backoff = self.cfg.initial_backoff_s
         for attempt in range(1, self.cfg.max_retries + 1):
             try:
-                async with self._session.post(url, data=payload) as resp:
+                # Use JSON so we don't battle URL-encoding oddities
+                async with self._session.post(url, json=payload) as resp:
                     if resp.status == 200:
                         return
                     # 429 or 5xx → retry with backoff
@@ -136,15 +155,17 @@ class TelegramNotifier:
         return base * (0.8 + 0.4 * random.random())
 
     @staticmethod
-    def _default_format(evt: dict) -> str:
+    def _default_format(evt: Mapping[str, Any]) -> str:
         """
-        Default alert text. evt is the AlertEvent dict your evaluator emits.
+        EXACTLY match your console format:
+        "[ALERT] {symbol} {rule} {type} value={value} msg='{message}'"
         """
         sym = evt.get("symbol", "?")
         rule = evt.get("rule", "")
+        etype = evt.get("type", "")
         value = evt.get("value", 0.0)
         msg = evt.get("message", "")
-        return f"[{sym}] {rule}: {value*100:.2f}%\n{msg}"
+        return f"[ALERT] {sym} {rule} {etype} value={value} msg='{msg}'"
 
 async def _maybe_text(resp: aiohttp.ClientResponse) -> str:
     try:
