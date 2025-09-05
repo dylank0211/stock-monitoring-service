@@ -231,16 +231,15 @@ class PercentMoveEvaluatorRedis:
             self._cooldown_until[cd_key] = epoch + dir_cd
         self._last_fired_pct[fired_key] = float(pct)
 
-        elapsed_min = (epoch - ref_epoch) / 60  
+        elapsed_min = max(0.0, (epoch - ref_epoch) / 60.0)
 
-        # Build rich alert event (used by format_alert_pretty)
         evt = {
             "symbol": symbol,
             "rule": self.rule.name,
             "type": "start",
-            "ts": float(epoch),                 # current bar epoch (s)
+            "ts": float(epoch),
             "direction": eff_direction,         # "up" | "down"
-            "pct": float(pct),                  # fraction (e.g., -0.0037)
+            "pct": float(pct),                  # fraction
             "window_seconds": int(self.rule.window_seconds),
 
             # Current point
@@ -250,13 +249,17 @@ class PercentMoveEvaluatorRedis:
             # Reference extremum
             "ref_price": float(ref_price),
             "ref_epoch": int(ref_epoch),
-            "ref_kind": ref_kind,               # e.g., "30m HIGH" or "30m LOW"
+            "ref_kind": ref_kind,               # "30m HIGH" or "30m LOW"
 
-            # Back-compat message (your pretty formatter will ignore this)
+            # New field used by the formatter:
+            "elapsed_min": float(elapsed_min),
+
+            # keep a simple message string for logs/back-compat (optional)
             "message": (
-                f"{symbol} {'↑' if eff_direction=='up' else '↓'} {pct*100:.2f}% in past {elapsed_min:.0f}m "
-                f"(ref: {self.rule.window_seconds // 60}m {'LOW' if eff_direction=='up' else 'HIGH'}) "
-                f"| {ref_price:.2f} @ {ref_epoch} → {last_close:.2f} now"
+                f"{symbol} {'↑' if eff_direction=='up' else '↓'} {pct*100:.2f}% "
+                f"in past {elapsed_min:.0f}m (ref: {self.rule.window_seconds//60}m "
+                f"{'LOW' if eff_direction=='up' else 'HIGH'}) | "
+                f"{ref_price:.2f} → {last_close:.2f}"
             ),
             "dedupe_key": dkey,
         }
